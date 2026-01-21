@@ -1,0 +1,168 @@
+version: "3.9"
+
+services:
+  # FastAPI Application
+  api:
+    build: .
+    container_name: manga-api
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - DEBUG=true
+      - DATABASE_URL=postgresql+asyncpg://manga:manga@postgres:5432/manga_scraper
+      - DATABASE_URL_SYNC=postgresql://manga:manga@postgres:5432/manga_scraper
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - S3_BUCKET_NAME=manga-images
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    volumes:
+      - ./manga_scraper:/app/manga_scraper:ro
+    command: >
+      sh -c "
+        python -c 'from manga_scraper.core.database import init_db; import asyncio; asyncio.run(init_db())' &&
+        uvicorn manga_scraper.api.app:app --host 0.0.0.0 --port 8000 --reload
+      "
+    restart: unless-stopped
+
+  # Celery Worker - HTTP Scraping
+  worker-http:
+    build: .
+    container_name: manga-worker-http
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://manga:manga@postgres:5432/manga_scraper
+      - DATABASE_URL_SYNC=postgresql://manga:manga@postgres:5432/manga_scraper
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./manga_scraper:/app/manga_scraper:ro
+    command: celery -A manga_scraper.workers.celery_app worker -Q scraper,downloader,default -c 4 -l INFO
+    restart: unless-stopped
+
+  # Celery Worker - Browser Scraping (resource intensive)
+  worker-browser:
+    build: .
+    container_name: manga-worker-browser
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://manga:manga@postgres:5432/manga_scraper
+      - DATABASE_URL_SYNC=postgresql://manga:manga@postgres:5432/manga_scraper
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - SCRAPER_CONCURRENT_BROWSERS=2
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./manga_scraper:/app/manga_scraper:ro
+    # Lower concurrency for browser workers (memory intensive)
+    command: celery -A manga_scraper.workers.celery_app worker -Q browser -c 2 -l INFO
+    shm_size: 2gb  # Shared memory for Chrome
+    restart: unless-stopped
+
+  # Celery Beat - Scheduler
+  scheduler:
+    build: .
+    container_name: manga-scheduler
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL_SYNC=postgresql://manga:manga@postgres:5432/manga_scraper
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - redis
+    volumes:
+      - ./manga_scraper:/app/manga_scraper:ro
+    command: celery -A manga_scraper.workers.celery_app beat -l INFO
+    restart: unless-stopped
+
+  # Flower - Celery Monitoring
+  flower:
+    build: .
+    container_name: manga-flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - redis
+    command: celery -A manga_scraper.workers.celery_app flower --port=5555
+    restart: unless-stopped
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: manga-postgres
+    environment:
+      - POSTGRES_USER=manga
+      - POSTGRES_PASSWORD=manga
+      - POSTGRES_DB=manga_scraper
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U manga -d manga_scraper"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: manga-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # MinIO (S3-compatible storage)
+  minio:
+    image: minio/minio:latest
+    container_name: manga-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
